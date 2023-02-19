@@ -194,7 +194,7 @@ func (c *Coordinator) changeState() {
 		}
 	} else if c.state == QUIT {
 		log.Println("coordinator exit")
-		os.Exit(-1)
+		os.Exit(0)
 	}
 }
 

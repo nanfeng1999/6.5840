@@ -65,7 +65,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		case NO_TASK:
 			break
 		case QUIT:
-			os.Exit(-1)
+			TaskDone(task.ID)
+			time.Sleep(time.Second)
+			os.Exit(0)
 		default:
 			DPrintln("unsupport task")
 			break
