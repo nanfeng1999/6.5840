@@ -196,6 +196,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 如果候选人的任期等于当前任期
 		// 如果当前节点没有给其他节点投过票 或者 已经给当前候选人投过票（RPC可能发生重传）
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+			//rf.changeState(FOLLOWER) // 当前节点状态变成follower
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 		} else {
@@ -371,32 +372,44 @@ func (rf *Raft) requestVotes() {
 
 	for i := range rf.peers {
 		if rf.me != i {
-			go func() {
+			// 需要传入参数 否则会出现规定时间内无法产生leader的情况
+			go func(peer int) {
 				// 发送RPC请求
 				args := &RequestVoteArgs{
 					Term:        rf.currentTerm, // 候选⼈的任期号
 					CandidateId: rf.me,          // 请求选票的候选⼈的 Id
 				}
 				reply := &RequestVoteReply{}
-				ok := rf.sendRequestVote(i, args, reply)
-				// 如果成功接收到回复 同时请求投票成功 那么票数+1
-				if ok && reply.VoteGranted {
-					numVotes += 1
-				}
 
-				// 已经出现了任期更大的节点 本节点强制转换为FOLLOWER
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					// 要强制转换成跟随者
-					rf.changeState(FOLLOWER)
-				}
+				// 下面的操作需要成功接收再执行
+				if rf.sendRequestVote(peer, args, reply) {
+					// 加锁 因为可能同时返回导致并发冲突
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
 
-				if numVotes > totalVotes/2 {
-					// 本节点当选Leader 选举停止 开始发送心跳包
-					rf.changeState(LEADER)
+					// 请求投票成功 那么票数+1
+					if reply.VoteGranted {
+						numVotes += 1
+
+						// 一旦票数达到 立即转换成leader 并给其他节点发送心跳包 否
+						if numVotes > totalVotes/2 {
+							// 本节点当选Leader 选举停止 开始发送心跳包
+							rf.changeState(LEADER)
+							// 选举成功需要马上把心跳包发送给其他节点 则可能出现leader已经存在 其他节点还在选举的情况
+							rf.sendEntries()
+						}
+					}
+
+					// 已经出现了任期更大的节点 本节点强制转换为FOLLOWER
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						// 要强制转换成跟随者
+						rf.changeState(FOLLOWER)
+					}
+
 				}
-			}()
+			}(i)
 		}
 	}
 
@@ -405,21 +418,22 @@ func (rf *Raft) requestVotes() {
 func (rf *Raft) sendEntries() {
 	for i := range rf.peers {
 		if rf.me != i {
-			go func() {
+			go func(peer int) {
 				// 发送RPC请求
 				args := &AppendEntriesArgs{
 					Term:     rf.currentTerm, // leader的任期
 					LeaderId: rf.me,          // leader的id号
 				}
 				reply := &AppendEntriesReply{}
-				ok := rf.sendAppendEntries(i, args, reply)
-				// 收到回复 对方的任期比当前leader的任期大 说明当前leader已经过期 变成follower
-				if ok && reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.changeState(FOLLOWER)
+				if rf.sendAppendEntries(peer, args, reply) {
+					// 收到回复 对方的任期比当前leader的任期大 说明当前leader已经过期 变成follower
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.changeState(FOLLOWER)
+					}
 				}
-			}()
+			}(i)
 		}
 	}
 }
@@ -430,9 +444,9 @@ func (rf *Raft) resetElectionTimeout() {
 }
 
 func randomElectionTime() time.Duration {
-	// 超时时间偏差 50 ~ 150 ms
-	ms := 50 + (rand.Int63() % 100)
-	// 超时计时器 350 ~ 450 ms
+	// 超时时间偏差 0 ~ 100 ms
+	ms := rand.Int63() % 100
+	// 超时计时器 300 ~ 400 ms
 	eleTime := time.Duration(ELECTION_TIMEOUT+ms) * time.Millisecond
 	return eleTime
 }
