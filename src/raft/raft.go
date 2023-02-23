@@ -308,7 +308,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2B 判断日志是否匹配
 	// 说明是心跳包 直接返回即可
-	// 下面这句话不能够加入
+	// 下面这句话不能够加入 因为leader第一次发送新日志到本节点 本节点接收成功 leader更新nextIndex
+	// 第二次leader发送日志为空 但是leaderCommit改变 如果这里直接返回 本节点第一次加入的新日志将一直无法提交
 	//if len(args.Logs) == 0 {
 	//	reply.Success = true
 	//	return
@@ -526,22 +527,20 @@ func (rf *Raft) requestVotes() {
 	rf.votedFor = rf.me // 自己给自己投票
 	numVotes := 1       // 自己给自己投票
 
+	// 不能放在闭包里面 因为 当前面的请求已经收到回复 后面的请求才刚才开始发送的时候 参数currentTerm会改变
+	args := &RequestVoteArgs{
+		Term:         rf.currentTerm,        // 候选⼈的任期号
+		CandidateId:  rf.me,                 // 请求选票的候选⼈的 Id
+		LastLogIndex: rf.getLastLog().Index, // 最后一条日志索引
+		LastLogTerm:  rf.getLastLog().Term,  // 最后一条日志任期
+	}
+
 	for i := range rf.peers {
 		if rf.me != i {
 			// 需要传入参数 否则会出现规定时间内无法产生leader的情况
 			go func(peer int) {
 				// 发送RPC请求
-				rf.mu.Lock()
-				args := &RequestVoteArgs{
-					Term:         rf.currentTerm,        // 候选⼈的任期号
-					CandidateId:  rf.me,                 // 请求选票的候选⼈的 Id
-					LastLogIndex: rf.getLastLog().Index, // 最后一条日志索引
-					LastLogTerm:  rf.getLastLog().Term,  // 最后一条日志任期
-				}
-				rf.mu.Unlock()
-
 				reply := &RequestVoteReply{}
-
 				// 下面的操作需要成功接收再执行
 				if rf.sendRequestVote(peer, args, reply) {
 					// 加锁 因为可能同时返回导致并发冲突
@@ -585,6 +584,11 @@ func (rf *Raft) sendEntries() {
 		if rf.me != i {
 			go func(peer int) {
 				rf.mu.Lock()
+				if rf.state != LEADER {
+					rf.mu.Unlock()
+					return
+				}
+
 				firstIndex := rf.getFirstLog().Index
 				// 发送RPC请求
 				args := &AppendEntriesArgs{
