@@ -19,9 +19,12 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
+	"sort"
+
 	//	"bytes"
 	"math/rand"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,7 +34,7 @@ import (
 )
 
 const (
-	ELECTION_TIMEOUT = 300
+	ELECTION_TIMEOUT = 200
 	HEARTBEAT        = 100 * time.Millisecond
 )
 
@@ -123,13 +126,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.logs)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -138,18 +141,19 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logs []Entry
+	var voteFor, currentTerm int
+	if d.Decode(&logs) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&currentTerm) != nil {
+		panic("decode persist state fail")
+	}
+
+	rf.logs = logs
+	rf.votedFor = voteFor
+	rf.currentTerm = currentTerm
 }
 
 // the service says it has created a snapshot that has
@@ -187,6 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2. 如果 votedFor 为空或者为 candidateId，并且候选⼈的日志至少和自己⼀样新，那么就投票给他（5.2 节， 5.4 节）
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm // 有更新的当前任期号
@@ -196,7 +201,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// todo 这个bug找了好久
 	if args.Term > rf.currentTerm {
-		rf.changeState(FOLLOWER)
+		if rf.state != FOLLOWER {
+			// 有一种可能是其他节点不停地超时选举 然后导致该节点一直重置选举计时器
+			// 正确的情况下是只有给其他节点成功投票才重置选举计时器 或者当前节点是过期leader的时候
+			rf.changeState(FOLLOWER)
+		}
 		rf.currentTerm, rf.votedFor = args.Term, -1
 	}
 	// 执行到这里说明 请求参数中的任期大于等于当前节点的任期
@@ -207,6 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// 2B 加上日志限制 日志需要是最新的
 		if rf.isLogMatch(args.LastLogIndex, args.LastLogTerm) {
+			DPrintf("node {%d} term {%d} vote for %d\n", rf.me, rf.currentTerm, args.CandidateId)
 			rf.changeState(FOLLOWER)       // 当前节点状态变成follower
 			rf.votedFor = args.CandidateId // 给候选者投票
 			reply.VoteGranted = true
@@ -280,6 +290,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前的任期号，⽤于领导⼈去更新⾃⼰
 	Success bool // 跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的⽇志时为真
+
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 // 发送追加日志和心跳包的RPC请求
@@ -289,12 +302,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("node {%d} term {%d} receive new log length %d\n", rf.me, rf.currentTerm, len(args.Logs))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	defer rf.persist()
+	DPrintf("node {%d} term {%d} receive new log length %d\n", rf.me, rf.currentTerm, len(args.Logs))
 	// 任期过期 什么也不做
 	if args.Term < rf.currentTerm {
+		DPrintf("node {%d} term {%d} reject term = %d log\n", rf.me, rf.currentTerm, args.Term)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -319,9 +333,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	DPrintf("node {%d} term {%d} start judge whether append log. rf.logs:%v,args.Logs:%v\n", rf.me, rf.currentTerm, rf.logs, args.Logs)
+	DPrintf("node {%d} term {%d} start judge whether append log\n", rf.me, rf.currentTerm)
 	// 如果上一条日志索引对应的日志 在本节点的日志队列中不存在 或者无法对应上 那么返回false 表示日志队列不匹配
 	if args.PreLogIndex > rf.getLastLog().Index || rf.logs[args.PreLogIndex-rf.getFirstLog().Index].Term != args.PreLogTerm {
+		DPrintf("node {%d} term {%d} reject append log\n", rf.me, rf.currentTerm)
+
+		// todo 补充按照任期回退
+		lastIndex := rf.getLastLog().Index
+		if lastIndex < args.PreLogIndex {
+			reply.ConflictTerm, reply.ConflictIndex = -1, lastIndex+1
+		} else {
+			firstIndex := rf.getFirstLog().Index
+			reply.ConflictTerm = rf.logs[args.PreLogIndex-firstIndex].Term
+			index := args.PreLogIndex - 1
+			for index >= firstIndex && rf.logs[index-firstIndex].Term == reply.ConflictTerm {
+				index--
+			}
+			reply.ConflictIndex = index
+		}
+
 		reply.Success = false
 		return
 	}
@@ -332,7 +362,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	firstIndex := rf.cropLogs(args)
 	// 附加日志
 	rf.logs = append(rf.logs, args.Logs[firstIndex:]...)
-	DPrintf("node {%d} term {%d} append log success. rf.logs:%v\n", rf.me, rf.currentTerm, rf.logs)
+	DPrintf("node {%d} term {%d} append log success\n", rf.me, rf.currentTerm)
 	// 求出新的commitIndex
 	newCommitIndex := min(args.LeaderCommit, rf.getLastLog().Index)
 	// 通知有新日志提交 如果是重传了已经加入日志队列的数据 那么commitIndex是不会变的 因此加入一个判断
@@ -373,6 +403,7 @@ func (rf *Raft) appendLog(command interface{}) Entry {
 	}
 
 	rf.logs = append(rf.logs, entry)
+	rf.persist()
 	return entry
 }
 
@@ -449,8 +480,8 @@ func (rf *Raft) ticker() {
 
 		select {
 		case <-rf.electionTimer.C:
-			DPrintf("node {%d} term {%d} start election\n", rf.me, rf.currentTerm)
 			rf.mu.Lock()
+			DPrintf("node {%d} term {%d} start election\n", rf.me, rf.currentTerm)
 			// FOLLOWER --> CANDIDATE
 			rf.changeState(CANDIDATE)
 			// 重置选举超时计时器
@@ -460,12 +491,13 @@ func (rf *Raft) ticker() {
 
 		case <-rf.heartbeatTimer.C:
 			// 只有领导人可以发送心跳包
+			// 锁放在上面 不然有数据竞争
+			rf.mu.Lock()
 			if rf.state == LEADER {
 				DPrintf("node {%d} term {%d} send heartbeat\n", rf.me, rf.currentTerm)
-				rf.mu.Lock()
 				rf.sendEntries()
-				rf.mu.Unlock()
 			}
+			rf.mu.Unlock()
 		}
 
 	}
@@ -480,10 +512,11 @@ func (rf *Raft) applyMsg() {
 		}
 		applyEntries := make([]Entry, rf.commitIndex-rf.lastApplied)
 		firstIndex := rf.getFirstLog().Index
+		commitIndex := rf.commitIndex
 		copy(applyEntries, rf.logs[rf.lastApplied-firstIndex+1:rf.commitIndex-firstIndex+1])
 		rf.mu.Unlock()
 
-		DPrintf("node {%d} term {%d} start commit log %v\n", rf.me, rf.currentTerm, applyEntries)
+		//DPrintf("node {%d} term {%d} start commit log %v\n", rf.me, rf.currentTerm, applyEntries)
 		for _, entry := range applyEntries {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -491,10 +524,12 @@ func (rf *Raft) applyMsg() {
 				CommandIndex: entry.Index,
 			}
 		}
-
+		//DPrintf("node {%d} term {%d} commit log success\n", rf.me, rf.currentTerm)
 		rf.mu.Lock()
+		// 这里不能使用commitIndex 因为有可能apply执行到这里 这个时候本节点又更新了一次commitIndex
+		// 那么第一次的更新就丢失了 会造成部分日志没有成功apply
 		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied = rf.commitIndex
+			rf.lastApplied = commitIndex
 		}
 		rf.mu.Unlock()
 
@@ -526,6 +561,7 @@ func (rf *Raft) requestVotes() {
 	rf.currentTerm += 1 // 任期加一
 	rf.votedFor = rf.me // 自己给自己投票
 	numVotes := 1       // 自己给自己投票
+	rf.persist()
 
 	// 不能放在闭包里面 因为 当前面的请求已经收到回复 后面的请求才刚才开始发送的时候 参数currentTerm会改变
 	args := &RequestVoteArgs{
@@ -569,6 +605,7 @@ func (rf *Raft) requestVotes() {
 							rf.votedFor = -1
 							// 要强制转换成跟随者
 							rf.changeState(FOLLOWER)
+							rf.persist()
 						}
 					}
 
@@ -613,6 +650,7 @@ func (rf *Raft) sendEntries() {
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
 							rf.changeState(FOLLOWER)
+							rf.persist()
 						} else {
 							// 2B 对方任期等于当前任期 或小于当前任期 那么判断日志接收的情况
 							if reply.Success {
@@ -623,10 +661,23 @@ func (rf *Raft) sendEntries() {
 								// 论文原话：如果存在⼀个满⾜ N > commitIndex 的 N，并且⼤多数的 matchIndex[i] ≥ N
 								// 成⽴，并且 log[N].term == currentTerm 成⽴，那么令 commitIndex 等于这个 N
 								//（5.3 和 5.4 节）
-								rf.updateLeaderCommit()
+								rf.updateLeaderCommitIndex()
 							} else {
 								// 回退 从上一个索引开始判断是否匹配
-								rf.nextIndex[peer] -= 1
+								//rf.nextIndex[peer] -= 1
+
+								// todo 补充按照任期回退
+								rf.nextIndex[peer] = reply.ConflictIndex
+								if reply.ConflictTerm != -1 {
+									firstIndex := rf.getFirstLog().Index
+									for i := args.PreLogIndex; i >= firstIndex; i-- {
+										if rf.logs[i-firstIndex].Term == reply.ConflictTerm {
+											rf.nextIndex[peer] = i + 1
+											break
+										}
+									}
+								}
+
 							}
 						}
 
@@ -639,13 +690,15 @@ func (rf *Raft) sendEntries() {
 	}
 }
 
-func (rf *Raft) updateLeaderCommit() {
+func (rf *Raft) updateLeaderCommitIndex() {
 	// 对matchIndex数组排序 然后求其中位数即可
-	sortMatchIndex := make([]int, len(rf.matchIndex))
+	n := len(rf.matchIndex)
+	sortMatchIndex := make([]int, n)
 	copy(sortMatchIndex, rf.matchIndex)
+	sortMatchIndex[rf.me] = rf.getLastLog().Index
 	sort.Ints(sortMatchIndex)
 
-	newCommitIndex := sortMatchIndex[len(sortMatchIndex)/2+1]
+	newCommitIndex := sortMatchIndex[n/2] // 因为本节点默认是满足条件的 所以不能够使用n/2 + 1
 	if newCommitIndex > rf.commitIndex && newCommitIndex <= rf.getLastLog().Index && rf.logs[newCommitIndex-rf.getFirstLog().Index].Term == rf.currentTerm {
 		DPrintf("leader node {%d} term {%d} update commitIndex %d to %d\n", rf.me, rf.currentTerm, rf.commitIndex, newCommitIndex)
 		rf.commitIndex = newCommitIndex
@@ -659,9 +712,9 @@ func (rf *Raft) resetElectionTimeout() {
 }
 
 func randomElectionTime() time.Duration {
-	// 超时时间偏差 0 ~ 100 ms
-	ms := rand.Int63() % 100
-	// 超时计时器 300 ~ 400 ms
+	// 超时时间偏差 0 ~ 200 ms
+	ms := rand.Int63() % 200
+	// 超时计时器 200 ~ 400 ms
 	eleTime := time.Duration(ELECTION_TIMEOUT+ms) * time.Millisecond
 	return eleTime
 }
@@ -698,8 +751,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.applyMsgCond = sync.NewCond(&rf.mu)
 	rf.applyCh = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	// 2D
+	//firstLog := rf.getFirstLog()
+	//rf.lastApplied = firstLog.Index
+	//rf.commitIndex = firstLog.Index
+	// 2B
 	lastLog := rf.getLastLog()
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = lastLog.Index + 1
