@@ -162,6 +162,8 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 }
 
@@ -291,8 +293,8 @@ type AppendEntriesReply struct {
 	Term    int  // 当前的任期号，⽤于领导⼈去更新⾃⼰
 	Success bool // 跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的⽇志时为真
 
-	ConflictTerm  int
-	ConflictIndex int
+	XTerm  int // 在冲突中的任期
+	XIndex int // 在冲突中的索引
 }
 
 // 发送追加日志和心跳包的RPC请求
@@ -338,18 +340,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PreLogIndex > rf.getLastLog().Index || rf.logs[args.PreLogIndex-rf.getFirstLog().Index].Term != args.PreLogTerm {
 		DPrintf("node {%d} term {%d} reject append log\n", rf.me, rf.currentTerm)
 
-		// todo 补充按照任期回退
+		// 按照任期回退索引
+		// 发生冲突的时候一共有三种可能
+		// 1. follower中没有preLogIndex对应的日志 那么nextIndex回退到刚好匹配的那个索引
+		// 2. follower中存在preLogIndex对应的日志 但是任期冲突 那么记录一下follower当前任期的第一条日志索引
+		// leader接收到冲突任期之后判断一下 如果本地存在冲突任期的日志
+		// 类似这种情况 112233 112222 那么leader应该回退到该任期对应的最后一条日志索引+1
+		// 3. leader接收到冲突任期之后判断一下 如果本地不存在冲突任期的日志
+		// 类似这种情况 112233 112244
 		lastIndex := rf.getLastLog().Index
-		if lastIndex < args.PreLogIndex {
-			reply.ConflictTerm, reply.ConflictIndex = -1, lastIndex+1
+		firstIndex := rf.getFirstLog().Index
+		if args.PreLogIndex > lastIndex {
+			reply.XIndex, reply.XTerm = lastIndex+1, -1
 		} else {
-			firstIndex := rf.getFirstLog().Index
-			reply.ConflictTerm = rf.logs[args.PreLogIndex-firstIndex].Term
-			index := args.PreLogIndex - 1
-			for index >= firstIndex && rf.logs[index-firstIndex].Term == reply.ConflictTerm {
-				index--
+			reply.XTerm = rf.logs[args.PreLogIndex-firstIndex].Term
+			for i := args.PreLogIndex - 1; i >= firstIndex; i-- {
+				if rf.logs[i-firstIndex].Term != reply.XTerm {
+					reply.XIndex = i + 1
+					break
+				}
 			}
-			reply.ConflictIndex = index
 		}
 
 		reply.Success = false
@@ -666,16 +676,19 @@ func (rf *Raft) sendEntries() {
 								// 回退 从上一个索引开始判断是否匹配
 								//rf.nextIndex[peer] -= 1
 
-								// todo 补充按照任期回退
-								rf.nextIndex[peer] = reply.ConflictIndex
-								if reply.ConflictTerm != -1 {
-									firstIndex := rf.getFirstLog().Index
-									for i := args.PreLogIndex; i >= firstIndex; i-- {
-										if rf.logs[i-firstIndex].Term == reply.ConflictTerm {
+								// 按照任期回退
+								firstIndex := rf.getFirstLog().Index
+								rf.nextIndex[peer] = reply.XIndex
+
+								if reply.XTerm != -1 {
+									// 如果存在和冲突任期一致的日志 那么返回第一个等于的
+									for i := args.PreLogIndex; i >= reply.XIndex; i-- {
+										if rf.logs[i-firstIndex].Term == reply.XTerm {
 											rf.nextIndex[peer] = i + 1
 											break
 										}
 									}
+									// 如果不存在那么默认等于XIndex 在前面已经赋值过了
 								}
 
 							}
