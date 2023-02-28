@@ -126,13 +126,17 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
+	rf.persister.Save(rf.encodeState(), rf.persister.ReadSnapshot())
+}
+
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.logs)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	return raftstate
 }
 
 // restore previously persisted state.
@@ -161,10 +165,88 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	// Your code here (2D)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("node {%d} snapshot index = %d", rf.me, index)
+	lastIncludedIndex := rf.getFirstLog().Index
+	if lastIncludedIndex >= index {
+		// 已经做过快照了 直接返回即可
+		return
+	}
+
+	// 裁剪日志
+	var tmp []Entry
+	rf.logs = append(tmp, rf.logs[index-lastIncludedIndex:]...)
+	// lastIncludedIndex和lastIncludedTerm都保存在这里
+	rf.logs[0].Command = nil
+
+	// 保存新的日志队列和快照
+	rf.persister.Save(rf.encodeState(), snapshot)
+}
+
+type InstallSnapshotArgs struct {
+	Term              int    // 任期
+	LeaderId          int    // 领导人Id
+	LastIncludedIndex int    // 快照中最后一个条目包含的索引
+	LastIncludedTerm  int    // 快照中最后一个条目包含的任期
+	Snapshot          []byte // 快照
+}
+
+type InstallSnapshotReply struct {
+	Term int // 任期
+}
+
+// InstallSnapshot 滞后或者因为发生RPC延迟 follower接收到快照
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("node {%d} term = %d receive args = %v", rf.me, rf.currentTerm, *args)
+	reply.Term = rf.currentTerm
+	// 任期过期直接返回
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 任期正确 或 任期更大
+	rf.currentTerm = args.Term
+	// 需要转换为跟随者 因为接收到快照也是leader存活的一种标志
+	rf.changeState(FOLLOWER)
+
+	firstIndex := rf.getFirstLog().Index
+	if rf.commitIndex >= args.LastIncludedIndex {
+		// 说明这个快照是因为RPC延迟的过期快照 直接丢弃即可
+		return
+	}
+
+	// 快照中的最后一个条目的索引大于或等于当前日志队列中的最后一条索引
+	if rf.getLastLog().Index <= args.LastIncludedIndex {
+		rf.logs = make([]Entry, 1)
+	} else {
+		var tmp []Entry
+		rf.logs = append(tmp, rf.logs[args.LastIncludedIndex-firstIndex:]...)
+	}
+
+	rf.logs[0].Term = args.LastIncludedTerm
+	rf.logs[0].Index = args.LastIncludedIndex
+	rf.logs[0].Command = nil
+	rf.persister.Save(rf.encodeState(), args.Snapshot)
+
+	rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Snapshot,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+	}()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
 }
 
 // example RequestVote RPC arguments structure.
@@ -330,8 +412,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//	reply.Success = true
 	//	return
 	//}
+	// 延迟的RPC请求 直接丢弃
 	if args.PreLogIndex < rf.getFirstLog().Index {
-		reply.Term, reply.Success = 0, false
+		reply.Success = false
 		return
 	}
 
@@ -637,69 +720,92 @@ func (rf *Raft) sendEntries() {
 				}
 
 				firstIndex := rf.getFirstLog().Index
-				// 发送RPC请求
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,                                // leader的任期
-					LeaderId:     rf.me,                                         // leader的id号
-					PreLogIndex:  rf.nextIndex[peer] - 1,                        // 发送日志条目上一条日志的索引
-					PreLogTerm:   rf.logs[rf.nextIndex[peer]-1-firstIndex].Term, // 发送日志条目上一条日志的任期 匹配才接收同步日志
-					Logs:         rf.logs[rf.nextIndex[peer]-firstIndex:],       // 下一批要同步过去的日志
-					LeaderCommit: rf.commitIndex,                                // leader已经提交的日志
-				}
-				rf.mu.Unlock()
-
-				reply := &AppendEntriesReply{}
-				if rf.sendAppendEntries(peer, args, reply) {
-					rf.mu.Lock()
-					// 2A
-					// 收到回复 对方的任期比当前leader的任期大 说明当前leader已经过期 变成follower
-					// 当前节点变成了follower 然后 后面的请求发送过来的时候当前节点的任期已经修改了 所以会进入else中的语句 然后修改nextIndex导致发生错误
-					// 不排除在此期间重新当选为leader然后导致错误的可能 所以任期也要判断一下
-					if rf.state == LEADER && rf.currentTerm == args.Term {
-						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.votedFor = -1
-							rf.changeState(FOLLOWER)
-							rf.persist()
-						} else {
-							// 2B 对方任期等于当前任期 或小于当前任期 那么判断日志接收的情况
-							if reply.Success {
-								// 匹配的日志索引
-								rf.matchIndex[peer] = args.PreLogIndex + len(args.Logs)
-								// 日志成功被接收 下一个应该返给这个节点的日志索引+1
-								rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-								// 论文原话：如果存在⼀个满⾜ N > commitIndex 的 N，并且⼤多数的 matchIndex[i] ≥ N
-								// 成⽴，并且 log[N].term == currentTerm 成⽴，那么令 commitIndex 等于这个 N
-								//（5.3 和 5.4 节）
-								rf.updateLeaderCommitIndex()
-							} else {
-								// 回退 从上一个索引开始判断是否匹配
-								//rf.nextIndex[peer] -= 1
-
-								// 按照任期回退
-								firstIndex := rf.getFirstLog().Index
-								rf.nextIndex[peer] = reply.XIndex
-
-								if reply.XTerm != -1 {
-									// 如果存在和冲突任期一致的日志 那么返回第一个等于的
-									for i := args.PreLogIndex; i >= reply.XIndex; i-- {
-										if rf.logs[i-firstIndex].Term == reply.XTerm {
-											rf.nextIndex[peer] = i + 1
-											break
-										}
-									}
-									// 如果不存在那么默认等于XIndex 在前面已经赋值过了
-								}
-
-							}
-						}
-
-					}
+				if rf.nextIndex[peer] <= firstIndex {
+					DPrintf("leader node {%d} term {%d} send snapshot to %d, nextIndex = %d firstIndex = %d\n", rf.me, rf.currentTerm, peer, rf.nextIndex[peer], firstIndex)
+					// 走发送快照的流程
+					args := rf.newInstallSnapshotArgs()
 					rf.mu.Unlock()
 
+					reply := &InstallSnapshotReply{}
+					if rf.sendInstallSnapshot(peer, args, reply) {
+						rf.mu.Lock()
+						rf.handleInstallSnapshotResponse(peer, args, reply)
+						rf.mu.Unlock()
+					}
+				} else {
+					// 走正常发送日志的流程
+					// 发送RPC请求
+					args := rf.newAppendEntriesArgs(peer)
+					rf.mu.Unlock()
+
+					reply := &AppendEntriesReply{}
+					if rf.sendAppendEntries(peer, args, reply) {
+						rf.mu.Lock()
+						rf.handleAppendEntriesResponse(peer, args, reply)
+						rf.mu.Unlock()
+					}
 				}
+
 			}(i)
 		}
+	}
+}
+
+func (rf *Raft) newAppendEntriesArgs(peer int) *AppendEntriesArgs {
+	firstIndex := rf.getFirstLog().Index
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,                                // leader的任期
+		LeaderId:     rf.me,                                         // leader的id号
+		PreLogIndex:  rf.nextIndex[peer] - 1,                        // 发送日志条目上一条日志的索引
+		PreLogTerm:   rf.logs[rf.nextIndex[peer]-1-firstIndex].Term, // 发送日志条目上一条日志的任期 匹配才接收同步日志
+		Logs:         rf.logs[rf.nextIndex[peer]-firstIndex:],       // 下一批要同步过去的日志
+		LeaderCommit: rf.commitIndex,                                // leader已经提交的日志
+	}
+	return args
+}
+
+func (rf *Raft) handleAppendEntriesResponse(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// 2A
+	// 收到回复 对方的任期比当前leader的任期大 说明当前leader已经过期 变成follower
+	// 当前节点变成了follower 然后 后面的请求发送过来的时候当前节点的任期已经修改了 所以会进入else中的语句 然后修改nextIndex导致发生错误
+	// 不排除在此期间重新当选为leader然后导致错误的可能 所以任期也要判断一下
+	if rf.state == LEADER && rf.currentTerm == args.Term {
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.changeState(FOLLOWER)
+			rf.persist()
+		} else {
+			// 2B 对方任期等于当前任期 或小于当前任期 那么判断日志接收的情况
+			if reply.Success {
+				// 匹配的日志索引
+				rf.matchIndex[peer] = args.PreLogIndex + len(args.Logs)
+				// 日志成功被接收 下一个应该返给这个节点的日志索引+1
+				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				// 论文原话：如果存在⼀个满⾜ N > commitIndex 的 N，并且⼤多数的 matchIndex[i] ≥ N
+				// 成⽴，并且 log[N].term == currentTerm 成⽴，那么令 commitIndex 等于这个 N
+				//（5.3 和 5.4 节）
+				rf.updateLeaderCommitIndex()
+			} else {
+				// 按照任期回退
+				firstIndex := rf.getFirstLog().Index
+				rf.nextIndex[peer] = reply.XIndex
+
+				if reply.XTerm != -1 {
+					// 如果存在和冲突任期一致的日志 那么返回第一个等于的
+					// 求最大值作为边界 减少遍历的次数
+					boundary := max(firstIndex, reply.XIndex)
+					for i := args.PreLogIndex; i >= boundary; i-- {
+						if rf.logs[i-firstIndex].Term == reply.XTerm {
+							rf.nextIndex[peer] = i + 1
+							break
+						}
+					}
+					// 如果不存在那么默认等于XIndex 在前面已经赋值过了
+				}
+			}
+		}
+
 	}
 }
 
@@ -717,6 +823,37 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		rf.commitIndex = newCommitIndex
 		rf.applyMsgCond.Signal() // 容易忘记通知
 	}
+}
+
+func (rf *Raft) newInstallSnapshotArgs() *InstallSnapshotArgs {
+	firstLog := rf.getFirstLog()
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: firstLog.Index,
+		LastIncludedTerm:  firstLog.Term,
+		Snapshot:          rf.persister.ReadSnapshot(),
+	}
+
+	return args
+}
+
+func (rf *Raft) handleInstallSnapshotResponse(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if rf.state == LEADER && rf.currentTerm == args.Term {
+		if rf.currentTerm < reply.Term {
+			// 任期过期 直接返回
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.changeState(FOLLOWER)
+			rf.persist()
+			return
+		} else {
+			DPrintf("node {%d} nextIndex from %d to %d\n", peer, rf.nextIndex[peer], args.LastIncludedIndex+1)
+			rf.nextIndex[peer] = args.LastIncludedIndex + 1
+			rf.matchIndex[peer] = args.LastIncludedIndex // 这一行代码容易忘记
+		}
+	}
+
 }
 
 // 重置本节点的超时截止时间
@@ -768,9 +905,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	// 2D
-	//firstLog := rf.getFirstLog()
-	//rf.lastApplied = firstLog.Index
-	//rf.commitIndex = firstLog.Index
+	firstLog := rf.getFirstLog()
+	rf.lastApplied = firstLog.Index
+	rf.commitIndex = firstLog.Index
 	// 2B
 	lastLog := rf.getLastLog()
 	for i := 0; i < len(rf.peers); i++ {
