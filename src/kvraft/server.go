@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -42,9 +43,13 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	// 3A
 	stateMachine   *MemoryKV                 // 状态机 记录kv
 	notifyChanMap  map[int]chan *CommonReply // 通知chan key = index val = chan
 	lastRequestMap map[int64]ReplyContext    // 缓存每个客户端对应的最近请求和reply key = clientId
+	// 3B
+	persist     *raft.Persister // 持久化
+	lastApplied int             // 最后被应用到kv中的command Index
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -85,6 +90,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	delete(kv.notifyChanMap, index)
 	kv.mu.Unlock()
+
+	// 不应该在这里保存快照 因为接收到命令的时候 你还不知道是否能够最终同步成功 所以应该在applier中保存快照
+	//if kv.persist.RaftStateSize() > kv.maxraftstate {
+	//	kv.rf.Snapshot(index, kv.encodeState())
+	//}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -137,7 +147,35 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	delete(kv.notifyChanMap, index)
 	kv.mu.Unlock()
+}
 
+func (kv *KVServer) getSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.lastRequestMap) // 这个也需要持久化，因为服务端崩溃重启 客户端可能还没有感知到 如果这个不保存 那么会出现重复命令的可能
+	kvstate := w.Bytes()
+	return kvstate
+}
+
+func (kv *KVServer) restoreSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var stateMachine MemoryKV
+	var lastRequestMap map[int64]ReplyContext
+
+	if d.Decode(&stateMachine) != nil ||
+		d.Decode(&lastRequestMap) != nil {
+		panic("decode persist state fail")
+	}
+
+	kv.stateMachine = &stateMachine
+	kv.lastRequestMap = lastRequestMap
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -189,6 +227,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.stateMachine = NewMemoryKV()
 	kv.notifyChanMap = make(map[int]chan *CommonReply)
 	kv.lastRequestMap = make(map[int64]ReplyContext)
+	kv.persist = persister
+
+	kv.restoreSnapshot(persister.ReadSnapshot())
 
 	go kv.applier()
 	DPrintf("server = %d start", kv.me)
@@ -200,12 +241,29 @@ func (kv *KVServer) applier() {
 		applyMsg := <-kv.applyCh
 
 		kv.mu.Lock()
-		reply := kv.apply(applyMsg.Command)
-		// 这个时候他可能不是leader 或者是发生了分区的旧leader 这两种情况下都不需要通知回复客户端
-		currentTerm, isLeader := kv.rf.GetState()
-		if isLeader && applyMsg.CommandTerm == currentTerm {
-			kv.notify(applyMsg.CommandIndex, reply)
+		if applyMsg.CommandValid {
+			// 假设本节点因为网络原因落后于其他的节点 其他节点到日志条目数为n1时做了一个快照 同时这个节点是leader节点
+			// 本节点请求日志的时候发现leader节点没有需要的日志（变成快照后删除了） 因此leader节点发送快照给本节点
+
+			// 如果有快照的时候会读取快照 这个时候如果leader中没有保存快照直接把日志发送过来的话 直接返回即可不需要应用
+			reply := kv.apply(applyMsg.Command)
+			// 这个时候他可能不是leader 或者是发生了分区的旧leader 这两种情况下都不需要通知回复客户端
+			currentTerm, isLeader := kv.rf.GetState()
+			if isLeader && applyMsg.CommandTerm == currentTerm {
+				kv.notify(applyMsg.CommandIndex, reply)
+			}
+
+			if kv.maxraftstate != -1 && kv.persist.RaftStateSize() > kv.maxraftstate {
+				DPrintf("server {%d} get snapshot index = %d", kv.me, applyMsg.CommandIndex)
+				kv.rf.Snapshot(applyMsg.CommandIndex, kv.getSnapshot())
+			}
+
+		} else if applyMsg.SnapshotValid {
+			DPrintf("server {%d} restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
+			kv.restoreSnapshot(applyMsg.Snapshot)
+
 		}
+
 		kv.mu.Unlock()
 	}
 }
@@ -236,7 +294,6 @@ func (kv *KVServer) applyLogToStateMachine(op *Op) *CommonReply {
 	case "Put":
 		kv.stateMachine.put(op.Key, op.Value)
 	case "Append":
-		DPrintf("server {%d} append key = %s value = %s", kv.me, op.Key, op.Value)
 		kv.stateMachine.appendVal(op.Key, op.Value)
 	}
 

@@ -1,25 +1,25 @@
 package kvraft
 
 type MemoryKV struct {
-	kv map[string]string
+	Data map[string]string
 }
 
 func (mkv *MemoryKV) put(key string, value string) {
-	mkv.kv[key] = value
+	mkv.Data[key] = value
 }
 
 func (mkv *MemoryKV) appendVal(key string, value string) {
-	originVal := mkv.kv[key]
-	mkv.kv[key] = originVal + value
+	originVal := mkv.Data[key]
+	mkv.Data[key] = originVal + value
 }
 
 func (mkv *MemoryKV) hasKey(key string) bool {
-	_, ok := mkv.kv[key]
+	_, ok := mkv.Data[key]
 	return ok
 }
 
 func (mkv *MemoryKV) get(key string) string {
-	return mkv.kv[key]
+	return mkv.Data[key]
 }
 
 func NewMemoryKV() *MemoryKV {

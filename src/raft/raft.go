@@ -59,6 +59,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int // 给lab3使用
 
 	// For 2D:
 	SnapshotValid bool
@@ -232,7 +233,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.logs[0].Index = args.LastIncludedIndex
 	rf.logs[0].Command = nil
 	rf.persister.Save(rf.encodeState(), args.Snapshot)
-
+	//fmt.Printf("node {%d} term = %d lastApplied = %d commitIndex = %d LastIncludedIndex = %d\n", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex, args.LastIncludedIndex)
 	rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
 	go func() {
 		rf.applyCh <- ApplyMsg{
@@ -541,6 +542,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm         // 当前的任期
 	isLeader = rf.state == LEADER // 是否是leader
 
+	rf.sendEntries()
 	return index, term, isLeader
 }
 
@@ -607,6 +609,7 @@ func (rf *Raft) applyMsg() {
 		firstIndex := rf.getFirstLog().Index
 		commitIndex := rf.commitIndex
 		copy(applyEntries, rf.logs[rf.lastApplied-firstIndex+1:rf.commitIndex-firstIndex+1])
+		//fmt.Printf("node {%d} term {%d} lastApplied = %d commitIndex = %d firstIndex = %d append entries %v\n", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex, firstIndex, applyEntries)
 		rf.mu.Unlock()
 
 		//DPrintf("node {%d} term {%d} start commit log %v\n", rf.me, rf.currentTerm, applyEntries)
@@ -615,15 +618,14 @@ func (rf *Raft) applyMsg() {
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
+				CommandTerm:  entry.Term,
 			}
 		}
 		//DPrintf("node {%d} term {%d} commit log success\n", rf.me, rf.currentTerm)
 		rf.mu.Lock()
-		// 这里不能使用commitIndex 因为有可能apply执行到这里 这个时候本节点又更新了一次commitIndex
+		// 这里不能使用rf.commitIndex 因为有可能apply执行到这里 这个时候本节点又更新了一次rf.commitIndex
 		// 那么第一次的更新就丢失了 会造成部分日志没有成功apply
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied = commitIndex
-		}
+		rf.lastApplied = max(rf.lastApplied, commitIndex)
 		rf.mu.Unlock()
 
 	}
@@ -754,12 +756,12 @@ func (rf *Raft) sendEntries() {
 func (rf *Raft) newAppendEntriesArgs(peer int) *AppendEntriesArgs {
 	firstIndex := rf.getFirstLog().Index
 	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,                                // leader的任期
-		LeaderId:     rf.me,                                         // leader的id号
-		PreLogIndex:  rf.nextIndex[peer] - 1,                        // 发送日志条目上一条日志的索引
-		PreLogTerm:   rf.logs[rf.nextIndex[peer]-1-firstIndex].Term, // 发送日志条目上一条日志的任期 匹配才接收同步日志
-		Logs:         rf.logs[rf.nextIndex[peer]-firstIndex:],       // 下一批要同步过去的日志
-		LeaderCommit: rf.commitIndex,                                // leader已经提交的日志
+		Term:         rf.currentTerm,                                     // leader的任期
+		LeaderId:     rf.me,                                              // leader的id号
+		PreLogIndex:  rf.nextIndex[peer] - 1,                             // 发送日志条目上一条日志的索引
+		PreLogTerm:   rf.logs[rf.nextIndex[peer]-1-firstIndex].Term,      // 发送日志条目上一条日志的任期 匹配才接收同步日志
+		Logs:         cloneLogs(rf.logs[rf.nextIndex[peer]-firstIndex:]), // 下一批要同步过去的日志
+		LeaderCommit: rf.commitIndex,                                     // leader已经提交的日志
 	}
 	return args
 }

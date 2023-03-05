@@ -25,3 +25,9 @@ func max(x int, y int) int {
 	}
 	return y
 }
+
+func cloneLogs(orig []Entry) []Entry {
+	x := make([]Entry, len(orig))
+	copy(x, orig)
+	return x
+}
