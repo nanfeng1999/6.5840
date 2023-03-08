@@ -68,22 +68,25 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	DPrintf("server = {%d} term = %d index = %d get Get args = %v", kv.me, term, index, args)
 	kv.mu.Lock()
-	kv.notifyChanMap[index] = make(chan *CommonReply)
+	kv.notifyChanMap[index] = make(chan *CommonReply, 1)
 	notifyChan := kv.notifyChanMap[index]
 	kv.mu.Unlock()
 
+	DPrintf("server = {%d} wait notify or timeout", kv.me)
 	select {
 	case ret := <-notifyChan:
 		DPrintf("server = %d get ret = %v", kv.me, ret)
 		reply.Value, reply.Err = ret.Value, ret.Err
 		currentTerm, isLeader := kv.rf.GetState()
 		if !isLeader || currentTerm != term {
+			DPrintf("server = {%d} notify false node, isLeader = %t currentTerm = %d term = %d", kv.me, isLeader, currentTerm, term)
 			reply.Err = ErrWrongLeader
 			return
 		}
 	case <-time.After(ExecuteTimeout):
-		DPrintf("server = %d timeout", kv.me)
+		DPrintf("server = {%d} timeout", kv.me)
 		reply.Err = TimeOut
 	}
 
@@ -100,7 +103,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
-	DPrintf("server = {%d} get putAppend args = %v", kv.me, args)
+
 	if kv.isOldRequest(args.ClientId, args.RequestId) {
 		DPrintf("server = {%d} get old request", kv.me)
 		reply.Err = OK
@@ -117,30 +120,32 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Key:       args.Key,
 		Value:     args.Value,
 	}
-	DPrintf("server = {%d} append log to raft", kv.me)
+
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
+	DPrintf("server = {%d} term = %d index = %d get putAppend args = %v", kv.me, term, index, args)
 	kv.mu.Lock()
-	kv.notifyChanMap[index] = make(chan *CommonReply)
+	kv.notifyChanMap[index] = make(chan *CommonReply, 1)
 	notifyChan := kv.notifyChanMap[index]
 	kv.mu.Unlock()
 
 	DPrintf("server = {%d} wait notify or timeout", kv.me)
 	select {
 	case ret := <-notifyChan:
-		DPrintf("server = %d get ret = %v", kv.me, ret)
+		DPrintf("server = {%d} get ret = %v", kv.me, ret)
 		reply.Err = ret.Err
 		currentTerm, isLeader := kv.rf.GetState()
 		if !isLeader || currentTerm != term {
+			DPrintf("server = {%d} notify false node, isLeader = %t currentTerm = %d term = %d", kv.me, isLeader, currentTerm, term)
 			reply.Err = ErrWrongLeader
 			return
 		}
 	case <-time.After(ExecuteTimeout):
-		DPrintf("server = %d timeout", kv.me)
+		DPrintf("server = {%d} timeout", kv.me)
 		reply.Err = TimeOut
 	}
 
@@ -238,39 +243,53 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 func (kv *KVServer) applier() {
 	for kv.killed() == false {
-		applyMsg := <-kv.applyCh
+		select {
+		case applyMsg := <-kv.applyCh:
+			DPrintf("server {%d} receive applyMsg = %v", kv.me, applyMsg)
+			kv.mu.Lock()
+			if applyMsg.CommandValid {
+				if applyMsg.CommandIndex <= kv.lastApplied {
+					DPrintf("server {%d} drop command index = %d lastApplied = %d", kv.me, applyMsg.CommandIndex, kv.lastApplied)
+					kv.mu.Unlock()
+					continue
+				}
+				// 假设本节点因为网络原因落后于其他的节点 其他节点到日志条目数为n1时做了一个快照 同时这个节点是leader节点
+				// 本节点请求日志的时候发现leader节点没有需要的日志（变成快照后删除了） 因此leader节点发送快照给本节点
 
-		kv.mu.Lock()
-		if applyMsg.CommandValid {
-			// 假设本节点因为网络原因落后于其他的节点 其他节点到日志条目数为n1时做了一个快照 同时这个节点是leader节点
-			// 本节点请求日志的时候发现leader节点没有需要的日志（变成快照后删除了） 因此leader节点发送快照给本节点
+				// 如果有快照的时候会读取快照 这个时候如果leader中没有保存快照直接把日志发送过来的话 直接返回即可不需要应用
+				reply := kv.apply(applyMsg.Command)
+				// 这个时候他可能不是leader 或者是发生了分区的旧leader 这两种情况下都不需要通知回复客户端
+				currentTerm, isLeader := kv.rf.GetState()
+				if isLeader && applyMsg.CommandTerm == currentTerm {
+					kv.notify(applyMsg.CommandIndex, reply)
+				}
 
-			// 如果有快照的时候会读取快照 这个时候如果leader中没有保存快照直接把日志发送过来的话 直接返回即可不需要应用
-			reply := kv.apply(applyMsg.Command)
-			// 这个时候他可能不是leader 或者是发生了分区的旧leader 这两种情况下都不需要通知回复客户端
-			currentTerm, isLeader := kv.rf.GetState()
-			if isLeader && applyMsg.CommandTerm == currentTerm {
-				kv.notify(applyMsg.CommandIndex, reply)
+				if kv.maxraftstate != -1 && kv.persist.RaftStateSize() > kv.maxraftstate {
+					DPrintf("server {%d} get snapshot index = %d maxraftstate = %d raftStateSize = %d\n", kv.me, applyMsg.CommandIndex, kv.maxraftstate, kv.persist.RaftStateSize())
+					kv.rf.Snapshot(applyMsg.CommandIndex, kv.getSnapshot())
+				}
+
+				kv.lastApplied = applyMsg.CommandIndex
+			} else if applyMsg.SnapshotValid {
+				if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+					DPrintf("server {%d} restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
+					kv.restoreSnapshot(applyMsg.Snapshot)
+					kv.lastApplied = applyMsg.SnapshotIndex
+				}
+
+			} else {
+				panic("1111")
 			}
 
-			if kv.maxraftstate != -1 && kv.persist.RaftStateSize() > kv.maxraftstate {
-				DPrintf("server {%d} get snapshot index = %d", kv.me, applyMsg.CommandIndex)
-				kv.rf.Snapshot(applyMsg.CommandIndex, kv.getSnapshot())
-			}
-
-		} else if applyMsg.SnapshotValid {
-			DPrintf("server {%d} restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
-			kv.restoreSnapshot(applyMsg.Snapshot)
-
+			kv.mu.Unlock()
 		}
-
-		kv.mu.Unlock()
 	}
 }
 
 func (kv *KVServer) apply(cmd interface{}) *CommonReply {
 	reply := &CommonReply{}
 	op := cmd.(Op)
+	DPrintf("server {%d} apply command = %v\n", kv.me, op)
 	// 有可能出现这边刚执行到这里 然后另一边重试 进来了重复命令 这边还没来得及更新 那边判断重复指令不重复
 	// 因此需要在应用日志之前再过滤一遍日志 如果发现有重复日志的话 那么就直接返回OK
 	if op.OpType != "Get" && kv.isOldRequest(op.ClientId, op.RequestId) {
@@ -303,9 +322,11 @@ func (kv *KVServer) applyLogToStateMachine(op *Op) *CommonReply {
 }
 
 func (kv *KVServer) notify(index int, reply *CommonReply) {
+	DPrintf("server {%d} notify index = %d\n", kv.me, index)
 	if notifyCh, ok := kv.notifyChanMap[index]; ok {
 		notifyCh <- reply
 	}
+	DPrintf("server {%d} notify index = %d\n", kv.me, index)
 }
 
 func (kv *KVServer) isOldRequest(clientId int64, requestId int64) bool {

@@ -52,18 +52,15 @@ func (ck *Clerk) Get(key string) string {
 
 	for {
 		if ck.servers[ck.LeaderId].Call("KVServer.Get", &args, &reply) {
-			DPrintf("client {%d} get reply = %v", ck.ClientId, reply)
+			DPrintf("client {%d} get from leader = %d reply = %v", ck.ClientId, ck.LeaderId, reply)
 			switch reply.Err {
-			case ErrWrongLeader:
+			case ErrWrongLeader, TimeOut:
 				ck.LeaderId = (ck.LeaderId + 1) % len(ck.servers)
 				break
 			case ErrNoKey, OK:
 				ret = reply.Value
 				ck.RequestId += 1
 				return ret
-			case TimeOut:
-				DPrintf("client {%d} retry", ck.ClientId)
-				break
 			}
 		} else {
 			ck.LeaderId = (ck.LeaderId + 1) % len(ck.servers)
@@ -88,17 +85,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	for {
 		if ck.servers[ck.LeaderId].Call("KVServer.PutAppend", &args, &reply) {
-			DPrintf("client {%d} get reply = %v", ck.ClientId, reply)
+			DPrintf("client {%d} get from leader = %d reply = %v", ck.ClientId, ck.LeaderId, reply)
 			switch reply.Err {
-			case ErrWrongLeader:
+			case ErrWrongLeader, TimeOut:
 				ck.LeaderId = (ck.LeaderId + 1) % len(ck.servers)
 				break
 			case ErrNoKey, OK:
 				ck.RequestId += 1
 				return
-			case TimeOut:
-				DPrintf("client {%d} retry", ck.ClientId)
-				break
 			}
 		} else {
 			// 否则连接不同 这个节点可能出现了故障 那么也需要换一个节点重试
