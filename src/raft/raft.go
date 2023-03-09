@@ -664,8 +664,9 @@ func (rf *Raft) applyMsg() {
 		rf.isAppendLog = true
 		rf.mu.Unlock()
 
-		for rf.isSnapshot {
-			time.Sleep(10 * time.Millisecond)
+		if rf.isSnapshot {
+			rf.isAppendLog = false
+			continue
 		}
 		//DPrintf("node {%d} term {%d} start commit log %v\n", rf.me, rf.currentTerm, applyEntries)
 		for _, entry := range applyEntries {
