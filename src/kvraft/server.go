@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -271,12 +271,16 @@ func (kv *KVServer) applier() {
 
 				kv.lastApplied = applyMsg.CommandIndex
 			} else if applyMsg.SnapshotValid {
-				if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
-					DPrintf("server {%d} restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
-					kv.restoreSnapshot(applyMsg.Snapshot)
-					kv.lastApplied = applyMsg.SnapshotIndex
+				if applyMsg.SnapshotIndex <= kv.lastApplied {
+					DPrintf("server {%d} drop snapshot index = %d lastApplied = %d", kv.me, applyMsg.SnapshotIndex, kv.lastApplied)
+					kv.mu.Unlock()
+					continue
 				}
 
+				DPrintf("server {%d} restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
+				kv.restoreSnapshot(applyMsg.Snapshot)
+				kv.lastApplied = applyMsg.SnapshotIndex
+				
 			} else {
 				panic("1111")
 			}
