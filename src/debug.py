@@ -101,7 +101,7 @@ def print_results(results: Dict[str, Dict[str, StatsMeter]], timing=False):
 
 
 def run_test(test: str, race: bool, timing: bool):
-    test_cmd = ["go", "test", f"-run={test}"]
+    test_cmd = ["go", "test", f"-run={test} -timeout=1m"]
     if race:
         test_cmd.append("-race")
     if timing:

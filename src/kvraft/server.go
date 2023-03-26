@@ -5,22 +5,10 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 	"bytes"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-const Debug = true
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-const ExecuteTimeout = 500 * time.Millisecond
 
 type Op struct {
 	// Your definitions here.
@@ -28,7 +16,7 @@ type Op struct {
 	// otherwise RPC will break.
 	ClientId  int64  // 客户端Id
 	RequestId int64  // 请求Id
-	OpType    string // 操作类型PutAppend/Get
+	OpType    string // 操作类型PutAppend/GET
 	Key       string // 添加的Key
 	Value     string // 添加的Value
 }
@@ -58,7 +46,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
-		OpType:    "Get",
+		OpType:    GET,
 		Key:       args.Key,
 	}
 
@@ -68,7 +56,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	DPrintf("server = {%d} term = %d index = %d get Get args = %v", kv.me, term, index, args)
+	DPrintf("server = {%d} term = %d index = %d get args = %v", kv.me, term, index, args)
 	kv.mu.Lock()
 	kv.notifyChanMap[index] = make(chan *CommonReply, 1)
 	notifyChan := kv.notifyChanMap[index]
@@ -83,7 +71,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		if !isLeader || currentTerm != term {
 			DPrintf("server = {%d} notify false node, isLeader = %t currentTerm = %d term = %d", kv.me, isLeader, currentTerm, term)
 			reply.Err = ErrWrongLeader
-			return
 		}
 	case <-time.After(ExecuteTimeout):
 		DPrintf("server = {%d} timeout", kv.me)
@@ -142,7 +129,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if !isLeader || currentTerm != term {
 			DPrintf("server = {%d} notify false node, isLeader = %t currentTerm = %d term = %d", kv.me, isLeader, currentTerm, term)
 			reply.Err = ErrWrongLeader
-			return
 		}
 	case <-time.After(ExecuteTimeout):
 		DPrintf("server = {%d} timeout", kv.me)
@@ -280,7 +266,7 @@ func (kv *KVServer) applier() {
 				DPrintf("server {%d} restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
 				kv.restoreSnapshot(applyMsg.Snapshot)
 				kv.lastApplied = applyMsg.SnapshotIndex
-				
+
 			} else {
 				panic("1111")
 			}
@@ -296,15 +282,16 @@ func (kv *KVServer) apply(cmd interface{}) *CommonReply {
 	DPrintf("server {%d} apply command = %v\n", kv.me, op)
 	// 有可能出现这边刚执行到这里 然后另一边重试 进来了重复命令 这边还没来得及更新 那边判断重复指令不重复
 	// 因此需要在应用日志之前再过滤一遍日志 如果发现有重复日志的话 那么就直接返回OK
-	if op.OpType != "Get" && kv.isOldRequest(op.ClientId, op.RequestId) {
+	if op.OpType != GET && kv.isOldRequest(op.ClientId, op.RequestId) {
 		reply.Err = OK
 	} else {
 		reply = kv.applyLogToStateMachine(&op)
-		if op.OpType != "Get" {
+		if op.OpType != GET {
 			kv.updateLastRequest(&op, reply)
 		}
 	}
 
+	reply.Err = OK
 	return reply
 }
 
@@ -312,11 +299,11 @@ func (kv *KVServer) applyLogToStateMachine(op *Op) *CommonReply {
 	var reply = &CommonReply{}
 
 	switch op.OpType {
-	case "Get":
+	case GET:
 		reply.Value = kv.stateMachine.get(op.Key)
-	case "Put":
+	case PUT:
 		kv.stateMachine.put(op.Key, op.Value)
-	case "Append":
+	case APPEND:
 		kv.stateMachine.appendVal(op.Key, op.Value)
 	}
 

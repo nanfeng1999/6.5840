@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"time"
 )
 
 const Debug = false
@@ -14,6 +15,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+const ExecuteTimeout = 500 * time.Millisecond
 
 //
 // Shard controler: assigns shards to replication groups.
@@ -140,20 +143,18 @@ func rebalanceShards(shards [NShards]int, groups map[int][]string) [NShards]int 
 		return [NShards]int{}
 	}
 
-	shard2group := make(map[int][]int, len(groups))
-
+	shard2group := getShard2Group(shards)
 	for gid, _ := range groups {
-		shard2group[gid] = make([]int, 0)
+		if _, ok := shard2group[gid]; !ok {
+			shard2group[gid] = make([]int, 0)
+		}
 	}
 
-	for sid, gid := range shards {
-		shard2group[gid] = append(shard2group[gid], sid)
-	}
 	DPrintf("shard2group = %v shards = %v groups = %v\n", shard2group, shards, groups)
 	for {
 
 		minGroup, maxGroup := getMinShardGroup(shard2group), getMaxShardGroup(shard2group)
-		//DPrintf("minGroup = %d maxGroup = %d\n", minGroup, maxGroup)
+		DPrintf("minGroup = %d maxGroup = %d\n", minGroup, maxGroup)
 		if maxGroup != 0 && len(shard2group[maxGroup])-len(shard2group[minGroup]) <= 1 {
 			DPrintf("shards = %v\n", shards)
 			return shards
@@ -227,4 +228,25 @@ func getMaxShardGroup(shard2group map[int][]int) int {
 	}
 
 	return maxGid
+}
+
+func getShard2Group(shards [NShards]int) map[int][]int {
+	shard2group := make(map[int][]int)
+
+	for sid, gid := range shards {
+		if _, ok := shard2group[gid]; !ok {
+			shard2group[gid] = make([]int, 0)
+		}
+		shard2group[gid] = append(shard2group[gid], sid)
+	}
+
+	return shard2group
+}
+
+func NewConfig() Config {
+	return Config{
+		Num:    0,
+		Shards: [NShards]int{},
+		Groups: make(map[int][]string),
+	}
 }

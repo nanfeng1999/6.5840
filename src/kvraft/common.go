@@ -1,5 +1,27 @@
 package kvraft
 
+import (
+	"log"
+	"time"
+)
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+const ExecuteTimeout = 500 * time.Millisecond
+
+const (
+	PUT    = "PUT"
+	GET    = "GET"
+	APPEND = "APPEND"
+)
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
@@ -9,11 +31,11 @@ const (
 
 type Err string
 
-// Put or Append
+// PUT or Append
 type PutAppendArgs struct {
 	Key   string
 	Value string
-	Op    string // "Put" or "Append"
+	Op    string // "PUT" or "Append"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.

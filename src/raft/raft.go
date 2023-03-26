@@ -95,8 +95,8 @@ type Raft struct {
 	matchIndex   []int // 对于每⼀个服务器，已经复制给他的日志的最高索引值
 	applyCh      chan ApplyMsg
 	applyMsgCond *sync.Cond // 提交日志到上层应用的条件变量 只有在成功提交新的日志的时候才会触发
-	isSnapshot   bool       // 是否正在保存快照到applyCh 这是为了维持日志与快照的顺序一致
-	isAppendLog  bool       // 是否正在加入新日志到applyCh
+	isSnapshot   uint32     // 是否正在保存快照到applyCh 这是为了维持日志与快照的顺序一致
+	isAppendLog  uint32     // 是否正在加入新日志到applyCh
 }
 
 type Entry struct {
@@ -227,6 +227,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	// 如果前面有快照正在保存 那么直接丢弃此快照 不然可能发生以下情况
+	// 第一个快照生成并解锁 但是还没有应用成功 第二个快照生成解锁 并应用
+	// 第一个快照 应用 因为第一个快照内容更少 相当于日志队列发生了回退
+	// 所以这里第一个快照如果在应用 第二个直接丢弃 不再应用
+	if atomic.LoadUint32(&rf.isSnapshot) == 1 {
+		reply.Term = -1
+		rf.mu.Unlock()
+		return
+	}
+
 	// 快照中的最后一个条目的索引大于或等于当前日志队列中的最后一条索引
 	if rf.getLastLog().Index <= args.LastIncludedIndex {
 		rf.logs = make([]Entry, 1)
@@ -243,13 +253,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	DPrintf("node {%d} term = %d logs = %v\n", rf.me, rf.currentTerm, rf.logs)
 
 	rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
-	for rf.isSnapshot {
-	}
 
-	rf.isSnapshot = true
+	rf.isSnapshot = 1
 	rf.mu.Unlock()
 
-	for rf.isAppendLog {
+	for atomic.LoadUint32(&rf.isAppendLog) == 1 {
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -260,7 +268,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-	rf.isSnapshot = false
+
+	atomic.StoreUint32(&rf.isSnapshot, 0)
+
 	DPrintf("end append snapshot\n")
 }
 
@@ -661,13 +671,15 @@ func (rf *Raft) applyMsg() {
 		copy(applyEntries, rf.logs[rf.lastApplied-firstIndex+1:rf.commitIndex-firstIndex+1])
 		DPrintf("node {%d} term {%d} lastApplied = %d commitIndex = %d firstIndex = %d append entries %v\n", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex, firstIndex, applyEntries)
 
-		rf.isAppendLog = true
-		rf.mu.Unlock()
-
-		if rf.isSnapshot {
-			rf.isAppendLog = false
+		if rf.isSnapshot == 1 {
+			rf.isAppendLog = 0
+			rf.mu.Unlock()
 			continue
 		}
+
+		rf.isAppendLog = 1
+		rf.mu.Unlock()
+
 		//DPrintf("node {%d} term {%d} start commit log %v\n", rf.me, rf.currentTerm, applyEntries)
 		for _, entry := range applyEntries {
 			rf.applyCh <- ApplyMsg{
@@ -677,7 +689,8 @@ func (rf *Raft) applyMsg() {
 				CommandTerm:  entry.Term,
 			}
 		}
-		rf.isAppendLog = false
+
+		atomic.StoreUint32(&rf.isAppendLog, 0)
 
 		//DPrintf("node {%d} term {%d} commit log success\n", rf.me, rf.currentTerm)
 		rf.mu.Lock()
@@ -857,12 +870,13 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, args *AppendEntriesArgs, r
 				// 如果有延迟的回复 是之前发生了冲突 这里直接更新的话nextIndex会倒退
 				// 如果这个时候peer节点正好记录了快照 那么会接收到preLogIndex < firstIndex的log entries
 				// 这种情况下返回的任期为0 这块地方的代码都不会执行 那么nextIndex永远不会改变
-				if reply.XIndex <= rf.matchIndex[peer] {
-					return
-				}
+				DPrintf("leader node {%d} term {%d} xIndex = %d peer = %d matchIndex = %d\n", rf.me, rf.currentTerm, reply.XIndex, peer, rf.matchIndex[peer])
+				//if reply.XIndex <= rf.matchIndex[peer] {
+				//	return
+				//}
 				// 按照任期回退
 				firstIndex := rf.getFirstLog().Index
-				rf.nextIndex[peer] = reply.XIndex
+				rf.nextIndex[peer] = max(reply.XIndex, rf.matchIndex[peer]+1)
 
 				if reply.XTerm != -1 {
 					// 如果存在和冲突任期一致的日志 那么返回第一个等于的
@@ -921,10 +935,12 @@ func (rf *Raft) handleInstallSnapshotResponse(peer int, args *InstallSnapshotArg
 			rf.changeState(FOLLOWER)
 			rf.persist()
 			return
-		} else {
+		} else if rf.currentTerm == reply.Term {
 			DPrintf("node {%d} nextIndex from %d to %d\n", peer, rf.nextIndex[peer], args.LastIncludedIndex+1)
 			rf.matchIndex[peer] = max(rf.matchIndex[peer], args.LastIncludedIndex) // 这一行代码容易忘记
 			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		} else if reply.Term == -1 {
+			// do nothing
 		}
 	}
 

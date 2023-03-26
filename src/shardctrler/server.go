@@ -20,8 +20,6 @@ type ShardCtrler struct {
 	lastRequestMap map[int64]ReplyContext    // 缓存每个客户端对应的最近请求和reply key = clientId
 }
 
-const ExecuteTimeout = 500 * time.Millisecond
-
 type Op struct {
 	// Your data here.
 	ClientId  int64            // 客户端Id
@@ -289,7 +287,6 @@ func (sc *ShardCtrler) addNewConfig(servers map[int][]string) {
 	if len(servers) == 0 {
 		return
 	}
-
 	lastCfg := sc.getLastConfig()
 	groups := copyMap(lastCfg.Groups)
 	newGroups := addMap(groups, servers)
